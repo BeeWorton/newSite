@@ -1,0 +1,17 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "kriljoona-api",
+	"main": "src/worker.js",
+	"compatibility_date": "2026-11-01",
+	"workers_dev": true,
+	"vars": {
+		"ALLOWED_ORIGINS": "https://benworton.com,https://www.benworton.com"
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "kriljoona-scores",
+			"database_id": "93abb36f-75a5-4195-ae6a-da9b54261505",
+		}
+	]
+}
