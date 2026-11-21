@@ -186,6 +186,57 @@ async function statsBoard(db, days, today) {
   }
   return {days, since, until:today, daily:daily.results||[],players};
 }
+// V4: extended, read-only analytics. Never expose token hashes or linked player IDs.
+// The overview includes every unique player/day; detailed profiles are limited to
+// the 60 most active players in the selected window to bound the API response.
+async function insightsBoard(db, days, today) {
+  const date = new Date(`${today}T12:00:00Z`);
+  date.setUTCDate(date.getUTCDate() - days + 1);
+  const since = date.toISOString().slice(0, 10);
+  const where = 'day >= ? AND day <= ?';
+  const [overview, dailyRows, distributionRows, profileRows] = await Promise.all([
+    db.prepare(`${SCORES_CTE} SELECT COUNT(*) AS plays, COUNT(DISTINCT player_id) AS players,
+      ROUND(AVG(score),1) AS average, MAX(score) AS best FROM scores WHERE ${where}`)
+      .bind(since, today).first(),
+    db.prepare(`${SCORES_CTE} SELECT day, COUNT(*) AS count, ROUND(AVG(score),1) AS average,
+      MAX(score) AS best FROM scores WHERE ${where} GROUP BY day ORDER BY day`)
+      .bind(since, today).all(),
+    db.prepare(`${SCORES_CTE} SELECT MIN(6, CAST(score / 100 AS INTEGER)) AS bucket,
+      COUNT(*) AS count FROM scores WHERE ${where} GROUP BY bucket ORDER BY bucket`)
+      .bind(since, today).all(),
+    db.prepare(`${SCORES_CTE} SELECT s.player_id,
+      (SELECT n.name FROM scores n WHERE n.player_id=s.player_id
+        ORDER BY n.day DESC, n.updated_at DESC LIMIT 1) AS name,
+      COUNT(*) AS plays, SUM(s.score) AS total, ROUND(AVG(s.score),1) AS average,
+      MAX(s.score) AS best FROM scores s WHERE s.day >= ? AND s.day <= ?
+      GROUP BY s.player_id ORDER BY plays DESC, total DESC, s.player_id ASC LIMIT 60`)
+      .bind(since, today).all()
+  ]);
+  const profiles = profileRows.results || [];
+  const profileIds = profiles.map(row => row.player_id);
+  let scores = [];
+  if (profileIds.length) {
+    const placeholders = profileIds.map(() => '?').join(',');
+    const history = await db.prepare(`${SCORES_CTE} SELECT player_id,day,score FROM scores
+      WHERE ${where} AND player_id IN (${placeholders}) ORDER BY day`)
+      .bind(since, today, ...profileIds).all();
+    scores = history.results || [];
+  }
+  const resultsById = new Map(profileIds.map(id => [id, []]));
+  for (const row of scores) resultsById.get(row.player_id)?.push({day:row.day, score:row.score});
+  return {
+    days, since, until:today,
+    summary:{plays:overview?.plays || 0,players:overview?.players || 0,
+      average:overview?.average || 0,best:overview?.best || 0,
+      activeDays:(dailyRows.results || []).length},
+    daily:(dailyRows.results || []).map(r => ({day:r.day,count:r.count,average:r.average,best:r.best})),
+    distribution:(distributionRows.results || []).map(r => ({bucket:r.bucket,count:r.count})),
+    playerLimit:60, limited:(overview?.players || 0) > profiles.length,
+    players:profiles.map((r,i) => ({id:`p${i+1}`, name:r.name, plays:r.plays,
+      total:r.total,average:r.average,best:r.best,results:resultsById.get(r.player_id) || []}))
+  };
+}
+
 async function createPairCode(db, tokenHash) {
   if (!tokenHash) return error('Missing player token.');
   const id=await playerId(db,tokenHash);
@@ -241,6 +292,11 @@ async function handleAPI(request, env) {
     return json(await dailyBoard(env.DB, day, hash));
   }
   if (request.method === 'GET' && url.pathname === '/api/all-time') return json(await allTimeBoard(env.DB, hash));
+  if (request.method === 'GET' && url.pathname === '/api/insights') {
+    const days = Number(url.searchParams.get('days') || 90);
+    if (![7,30,90,365].includes(days)) return error('Select 7, 30, 90 or 365 days.');
+    return json(await insightsBoard(env.DB, days, today));
+  }
   if (request.method === 'GET' && url.pathname === '/api/stats') {
     const days = Number(url.searchParams.get('days') || 30);
     if (![7,30,90].includes(days)) return error('Select 7, 30, or 90 days.');
