@@ -116,45 +116,115 @@ async function importHistory(request, env, today) {
   return json({ok:true, imported:rows.length, dates:[...new Set(rows.map(r=>r.day))].sort()});
 }
 
-async function dailyBoard(db, day, tokenHash) {
-  const [rows, stats] = await Promise.all([
-    db.prepare('SELECT name, score, created_at FROM entries WHERE day = ? ORDER BY score DESC, created_at ASC LIMIT ?').bind(day, LIMIT).all(),
-    db.prepare('SELECT COUNT(*) AS count, MAX(score) AS topScore, ROUND(AVG(score)) AS average FROM entries WHERE day = ?').bind(day).first()
-  ]);
-  const entries = (rows.results || []).map((row, index) => ({name: row.name, score: row.score, created_at: row.created_at, rank: index + 1}));
-  let me = null;
-  if (tokenHash) {
-    const own = await db.prepare('SELECT name, score, created_at FROM entries WHERE day = ? AND token_hash = ?').bind(day, tokenHash).first();
-    if (own) {
-      const ahead = await db.prepare('SELECT COUNT(*) AS n FROM entries WHERE day = ? AND (score > ? OR (score = ? AND created_at < ?))').bind(day, own.score, own.score, own.created_at).first();
-      me = {name:own.name, score:own.score, rank:(ahead?.n || 0) + 1};
-      if (me.rank <= entries.length) entries[me.rank - 1].isYou = true;
-    }
-  }
-  return {date: day, entries, count: stats?.count || 0, topScore: stats?.topScore || 0, average: stats?.average || 0, me};
+// The old entries table is preserved. Unlinked browsers map to their own hash;
+// an opt-in identity_links row maps additional browser hashes to the same person.
+// If linked browsers have entries on the same day, count the highest only.
+const SCORES_CTE = `WITH ranked AS (
+  SELECT COALESCE(l.player_id, e.token_hash) AS player_id, e.name, e.day, e.score,
+    e.created_at, e.updated_at,
+    ROW_NUMBER() OVER (PARTITION BY COALESCE(l.player_id, e.token_hash), e.day
+      ORDER BY e.score DESC, e.updated_at DESC, e.created_at ASC) AS chosen
+  FROM entries e LEFT JOIN identity_links l ON l.token_hash = e.token_hash
+), scores AS (SELECT player_id, name, day, score, created_at, updated_at FROM ranked WHERE chosen = 1)`;
+async function playerId(db, tokenHash) {
+  if (!tokenHash) return null;
+  const row = await db.prepare('SELECT player_id FROM identity_links WHERE token_hash = ?').bind(tokenHash).first();
+  return row?.player_id || tokenHash;
 }
-async function allTimeBoard(db, tokenHash) {
-  const query = `SELECT token_hash, SUM(score) AS score, COUNT(*) AS dives, MAX(score) AS best,
-    (SELECT name FROM entries newer WHERE newer.token_hash = entries.token_hash ORDER BY day DESC, updated_at DESC LIMIT 1) AS name
-    FROM entries GROUP BY token_hash ORDER BY score DESC, best DESC, token_hash ASC LIMIT ?`;
+async function dailyBoard(db, day, tokenHash) {
+  const id = await playerId(db, tokenHash);
   const [rows, stats] = await Promise.all([
-    db.prepare(query).bind(LIMIT).all(),
-    db.prepare('SELECT COUNT(DISTINCT token_hash) AS count, COUNT(*) AS dives FROM entries').first()
+    db.prepare(`${SCORES_CTE} SELECT player_id,name,score,created_at FROM scores WHERE day = ? ORDER BY score DESC, created_at ASC, player_id ASC LIMIT ?`).bind(day, LIMIT).all(),
+    db.prepare(`${SCORES_CTE} SELECT COUNT(*) AS count, MAX(score) AS topScore, ROUND(AVG(score)) AS average FROM scores WHERE day = ?`).bind(day).first()
   ]);
-  const entries = (rows.results || []).map((row, index) => ({name:row.name, score:row.score, dives:row.dives, best:row.best, rank:index+1, isYou:!!tokenHash && row.token_hash===tokenHash}));
-  // Never expose anonymous identity hashes to the client.
+  const entries = (rows.results || []).map((row, i) => ({name:row.name, score:row.score, created_at:row.created_at, rank:i+1, isYou:!!id && id===row.player_id}));
   let me = null;
-  if (tokenHash) {
-    const own = await db.prepare('SELECT SUM(score) AS score, COUNT(*) AS dives, MAX(score) AS best FROM entries WHERE token_hash = ?').bind(tokenHash).first();
-    if (own?.dives) {
-      const rank = await db.prepare(`SELECT COUNT(*) + 1 AS rank FROM (
-        SELECT token_hash, SUM(score) AS total, MAX(score) AS best FROM entries GROUP BY token_hash
-      ) WHERE total > ? OR (total = ? AND best > ?) OR (total = ? AND best = ? AND token_hash < ?)`)
-        .bind(own.score, own.score, own.best, own.score, own.best, tokenHash).first();
-      me = {score:own.score, dives:own.dives, best:own.best, rank:rank.rank};
+  if (id) {
+    const own = await db.prepare(`${SCORES_CTE} SELECT name,score,created_at FROM scores WHERE day = ? AND player_id = ?`).bind(day,id).first();
+    if (own) {
+      const ahead = await db.prepare(`${SCORES_CTE} SELECT COUNT(*) AS n FROM scores WHERE day = ? AND (score > ? OR (score = ? AND (created_at < ? OR (created_at = ? AND player_id < ?))))`)
+        .bind(day,own.score,own.score,own.created_at,own.created_at,id).first();
+      me = {name:own.name, score:own.score, rank:(ahead?.n || 0)+1};
     }
   }
-  return {entries, count: stats?.count || 0, dives:stats?.dives || 0, topScore:entries[0]?.score || me?.score || 0, average:0, me};
+  return {date:day, entries, count:stats?.count || 0, topScore:stats?.topScore || 0, average:stats?.average || 0, me};
+}
+const PLAYER_TOTALS = `${SCORES_CTE}, totals AS (
+  SELECT player_id, SUM(score) AS score, COUNT(*) AS dives, MAX(score) AS best,
+  (SELECT name FROM scores newest WHERE newest.player_id = scores.player_id ORDER BY day DESC, updated_at DESC LIMIT 1) AS name
+  FROM scores GROUP BY player_id)`;
+async function allTimeBoard(db, tokenHash) {
+  const id = await playerId(db,tokenHash);
+  const [rows, stats] = await Promise.all([
+    db.prepare(`${PLAYER_TOTALS} SELECT * FROM totals ORDER BY score DESC, best DESC, player_id ASC LIMIT ?`).bind(LIMIT).all(),
+    db.prepare(`${SCORES_CTE} SELECT COUNT(DISTINCT player_id) AS count, COUNT(*) AS dives FROM scores`).first()
+  ]);
+  const entries = (rows.results || []).map((row,i)=>({name:row.name,score:row.score,dives:row.dives,best:row.best,rank:i+1,isYou:!!id&&id===row.player_id}));
+  let me = null;
+  if (id) {
+    const own = await db.prepare(`${PLAYER_TOTALS} SELECT * FROM totals WHERE player_id = ?`).bind(id).first();
+    if (own) {
+      const rank = await db.prepare(`${PLAYER_TOTALS} SELECT COUNT(*)+1 AS rank FROM totals WHERE score > ? OR (score = ? AND (best > ? OR (best = ? AND player_id < ?)))`)
+        .bind(own.score,own.score,own.best,own.best,id).first();
+      me={score:own.score,dives:own.dives,best:own.best,rank:rank.rank};
+    }
+  }
+  return {entries,count:stats?.count||0,dives:stats?.dives||0,topScore:entries[0]?.score||me?.score||0,average:0,me};
+}
+async function statsBoard(db, days, today) {
+  const date = new Date(`${today}T12:00:00Z`);
+  date.setUTCDate(date.getUTCDate()-days+1);
+  const since=date.toISOString().slice(0,10);
+  const [daily, top] = await Promise.all([
+    db.prepare(`${SCORES_CTE} SELECT day,COUNT(*) AS count,ROUND(AVG(score)) AS average,MAX(score) AS best FROM scores WHERE day >= ? AND day <= ? GROUP BY day ORDER BY day`).bind(since,today).all(),
+    db.prepare(`${PLAYER_TOTALS} SELECT player_id,name,score FROM totals ORDER BY score DESC,player_id ASC LIMIT 5`).all()
+  ]);
+  const players = [];
+  for (const row of top.results||[]) {
+    const recent=await db.prepare(`${SCORES_CTE} SELECT day,score FROM scores WHERE player_id = ? AND day >= ? AND day <= ? ORDER BY day`).bind(row.player_id,since,today).all();
+    players.push({name:row.name,total:row.score,results:(recent.results||[]).map(r=>({day:r.day,score:r.score}))});
+  }
+  return {days, since, until:today, daily:daily.results||[],players};
+}
+async function createPairCode(db, tokenHash) {
+  if (!tokenHash) return error('Missing player token.');
+  const id=await playerId(db,tokenHash);
+  const hasScores=await db.prepare(`${SCORES_CTE} SELECT 1 AS yes FROM scores WHERE player_id = ? LIMIT 1`).bind(id).first();
+  if (!hasScores) return error('Submit a score on this browser before pairing.',409);
+  const bytes=crypto.getRandomValues(new Uint8Array(8));
+  const code=[...bytes].map(x=>x.toString(16).padStart(2,'0')).join('').toUpperCase();
+  const time=Math.floor(Date.now()/1000);
+  await db.prepare('INSERT INTO device_pair_codes (code_hash,source_hash,expires_at,created_at) VALUES (?,?,?,?)')
+    .bind(await hashToken(code),tokenHash,time+600,time).run();
+  return json({code,expiresInSeconds:600});
+}
+async function redeemPairCode(request, db, tokenHash) {
+  if (!tokenHash) return error('Missing player token.');
+  if (!(request.headers.get('Content-Type')||'').includes('application/json')) return error('Please send JSON.');
+  const raw=await request.text();
+  if (raw.length>256) return error('Code is too large.',413);
+  let payload;try{payload=JSON.parse(raw);}catch{return error('Invalid pairing code.');}
+  const code=String(payload?.code||'').replace(/[\s-]/g,'').toUpperCase();
+  if (!/^[A-F0-9]{16}$/.test(code)) return error('Invalid pairing code.');
+  const codeHash=await hashToken(code), time=Math.floor(Date.now()/1000);
+  const pair=await db.prepare('SELECT source_hash FROM device_pair_codes WHERE code_hash=? AND redeemed_at IS NULL AND expires_at > ?').bind(codeHash,time).first();
+  if (!pair) return error('Pairing code is invalid, expired or already used.',400);
+  const sourceId=await playerId(db,pair.source_hash);
+  const receiverId=await playerId(db,tokenHash);
+  if (sourceId===receiverId) {
+    await db.prepare('UPDATE device_pair_codes SET redeemed_at=? WHERE code_hash=? AND redeemed_at IS NULL').bind(time,codeHash).run();
+    return json({ok:true,alreadyLinked:true});
+  }
+  // Batched statements are transactional in D1. Conditional writes ensure a
+  // consumed or expired code cannot be raced to attach a second browser.
+  const valid='EXISTS (SELECT 1 FROM device_pair_codes WHERE code_hash=? AND redeemed_at IS NULL AND expires_at > ?)';
+  await db.batch([
+    db.prepare(`UPDATE identity_links SET player_id=? WHERE player_id=? AND ${valid}`).bind(sourceId,receiverId,codeHash,time),
+    db.prepare(`INSERT OR REPLACE INTO identity_links (token_hash,player_id) SELECT ?,? WHERE ${valid}`).bind(receiverId,sourceId,codeHash,time),
+    db.prepare(`INSERT OR REPLACE INTO identity_links (token_hash,player_id) SELECT ?,? WHERE ${valid}`).bind(tokenHash,sourceId,codeHash,time),
+    db.prepare('UPDATE device_pair_codes SET redeemed_at=? WHERE code_hash=? AND redeemed_at IS NULL AND expires_at > ?').bind(time,codeHash,time)
+  ]);
+  return json({ok:true,alreadyLinked:false});
 }
 
 async function handleAPI(request, env) {
@@ -171,6 +241,13 @@ async function handleAPI(request, env) {
     return json(await dailyBoard(env.DB, day, hash));
   }
   if (request.method === 'GET' && url.pathname === '/api/all-time') return json(await allTimeBoard(env.DB, hash));
+  if (request.method === 'GET' && url.pathname === '/api/stats') {
+    const days = Number(url.searchParams.get('days') || 30);
+    if (![7,30,90].includes(days)) return error('Select 7, 30, or 90 days.');
+    return json(await statsBoard(env.DB, days, today));
+  }
+  if (request.method === 'POST' && url.pathname === '/api/link/create') return createPairCode(env.DB,hash);
+  if (request.method === 'POST' && url.pathname === '/api/link/redeem') return redeemPairCode(request,env.DB,hash);
   if (request.method === 'POST' && url.pathname === '/api/submit') {
     if (!(request.headers.get('Content-Type') || '').toLowerCase().includes('application/json')) return error('Please send JSON.');
     const length = Number(request.headers.get('Content-Length') || 0);
