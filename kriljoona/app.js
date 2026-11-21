@@ -5,6 +5,7 @@
   const $ = id => document.getElementById(id);
   const translations = {
     fi: {
+      navStats:'Tilastot',statsKicker:'✦ Sukellusten historia',statsTitle:'Tulokset <em>ajan mittaan.</em>',statsDescription:'Seuraa päivän keskiarvoja ja huipputuloksia sekä viiden parhaan pelaajan kehitystä.',range7:'7 päivää',range30:'30 päivää',range90:'90 päivää',dailyTrends:'Päivän tulokset',dailyTrendsInfo:'Päivän keskiarvo ja paras tulos',playerTrends:'Pelaajien kehitys',playerTrendsInfo:'Viisi eniten kokonaispisteitä saanutta pelaajaa',chartAverage:'Keskiarvo',chartBest:'Paras tulos',chartNoData:'Ei vielä tuloksia tällä aikavälillä.',pairTitle:'Yhdistä selaimet (valinnainen)',pairDescription:'Ei kirjautumista. Jos pelaat useassa selaimessa, luo ensimmäisessä kertakäyttöinen koodi ja syötä se toisessa. Tulokset yhdistyvät saman pelaajan alle.',pairCreate:'Luo yhdistämiskoodi',pairEnter:'Tai syötä toisessa selaimessa luotu koodi',pairRedeem:'Yhdistä tämä selain',pairSafety:'Koodi on voimassa 10 minuuttia ja toimii vain kerran. Älä jaa sitä muille.',pairCreated:'Kopioi koodi toiseen selaimeen 10 minuutin kuluessa.',pairLinked:'Selaimet yhdistetty! Tulokset näkyvät nyt samalla pelaajalla.',pairAlready:'Nämä selaimet ovat jo yhdistetty.',pairInvalid:'Koodi on virheellinen, vanhentunut tai käytetty.',pairFirstScore:'Ilmoita tulos tässä selaimessa ennen koodin luomista.',pairUnavailable:'Selainten yhdistäminen toimii vain julkaistun palvelimen kautta.',
       adminLink:'Ylläpito ↗',brandCaption:'Krillionin tulostaulu',navLeaderboard:'Tulostaulu',navHow:'Ohjeet',navSubmit:'Ilmoita tulos ↗',
       heroEyebrow:'Pientä kisailua',heroTitle:'Kuinka <em>syvälle</em><br> pääsit?',
       heroCopy:'Seitsemän kysymystä. Yksi sukellus päivässä. Vertaile tuloksia kavereiden kanssa ja nouse tulostaulun kärkeen.',
@@ -44,6 +45,7 @@
       pageTitle:'Kriljoona – päivän tulostaulu',pageDescription:'Kriljoona: Krillionin päivittäinen yhteisötulostaulu. Ilmoita tuloksesi ja vertaa sijoitustasi muihin pelaajiin.'
     },
     en: {
+      navStats:'Statistics',statsKicker:'✦ Dive history',statsTitle:'Scores <em>over time.</em>',statsDescription:'Explore daily averages, high scores, and the progress of the top five players.',range7:'7 days',range30:'30 days',range90:'90 days',dailyTrends:'Daily scores',dailyTrendsInfo:'Daily average and highest submitted score',playerTrends:'Player progress',playerTrendsInfo:'Five players with the highest lifetime totals',chartAverage:'Average',chartBest:'Best score',chartNoData:'No results in this date range yet.',pairTitle:'Link browsers (optional)',pairDescription:'No login needed. If you play on multiple browsers, generate a one-time code in the first and enter it in the second. Their scores will count toward one player.',pairCreate:'Generate a linking code',pairEnter:'Or enter a code from another browser',pairRedeem:'Link this browser',pairSafety:'Codes expire after 10 minutes and work once. Do not share them with others.',pairCreated:'Copy the code to your other browser within 10 minutes.',pairLinked:'Browsers linked! Your results now count toward the same player.',pairAlready:'These browsers are already linked.',pairInvalid:'The code is invalid, expired, or already used.',pairFirstScore:'Submit a score on this browser before generating a code.',pairUnavailable:'Browser linking is only available on the live site.',
       adminLink:'Admin ↗',brandCaption:'The Krillion leaderboard',navLeaderboard:'Leaderboard',navHow:'How it works',navSubmit:'Submit score ↗',
       heroEyebrow:'A little friendly competition',heroTitle:'How <em>deep</em><br> did you dive?',
       heroCopy:'Seven questions. One daily dive. Compare scores with your friends and claim your spot on the board.',
@@ -97,7 +99,7 @@
   const configured = String(window.KRILJOONA_CONFIG?.apiBaseUrl || '').trim().replace(/\/+$/, '');
   // The public frontend lives on GitHub Pages. The backend is a separate Cloudflare Worker.
   const API_ROOT = /^https:\/\/[^\s/]+\//.test(configured + '/') || /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?\//.test(configured + '/') ? configured.replace(/\/api$/, '') + '/api' : '';
-  const state = {date:today,tab:'daily',demo:!API_ROOT,data:null,lastScore:null,requestId:0};
+  const state = {date:today,tab:'daily',demo:!API_ROOT,data:null,lastScore:null,requestId:0,statsDays:30,statsData:null,statsRequestId:0};
   const demoKey = 'kriljoona-demo-v1';
   function getDemoDB() {
     try {const d=JSON.parse(getSaved(demoKey)); if(d && d.seedDate===today && Array.isArray(d.entries)) return d;} catch {}
@@ -144,7 +146,7 @@
     setText('year',new Date().getFullYear());
     for(const choice of ['fi','en']){$('lang-'+choice).classList.toggle('lang-active',choice===language);$('lang-'+choice).setAttribute('aria-pressed',String(choice===language));}
     $('demo-ribbon').classList.toggle('hidden',!state.demo);
-    updateTabLabels();if(state.data) render(state.data);else updatePreview();
+    updateTabLabels();if(state.data) render(state.data);else updatePreview();if(state.statsData)renderCharts(state.statsData);
   }
   function updateTabLabels() {
     const all=state.tab==='alltime';$('daily-tab').classList.toggle('active',!all);$('alltime-tab').classList.toggle('active',all);
@@ -181,6 +183,85 @@
     setText('s3label',t(all?'divesLogged':'avgDive'));setText('s3',number(all?data.dives:data.average));setText('s3sub',t(all?'allDays':'perPlayer'));
     setText('s4label',t('yourPosition'));setText('s4',data.me?rankWord(data.me.rank):'—');setText('s4sub',data.me?t('improveRank'):state.date===today||all?t('joinBoard'):t('noPastScore'));
   }
+  const chartColors=['#aceada','#f1af8f','#d8f1b4','#a7b7f2','#f1dab0'];
+  function demoStats(days) {
+    const all=getDemoDB().entries;
+    const from=pastDate(today,1-days);
+    const perDay=new Map(),perPlayer=new Map();
+    for (const e of all) {
+      if (e.day<from||e.day>today) continue;
+      const d=perDay.get(e.day)||[];d.push(e.score);perDay.set(e.day,d);
+      const p=perPlayer.get(e.id)||{name:e.name,total:0,results:[]};
+      p.name=e.name;p.total+=e.score;p.results.push({day:e.day,score:e.score});perPlayer.set(e.id,p);
+    }
+    const daily=[...perDay].map(([day,values])=>({day,count:values.length,average:Math.round(values.reduce((a,b)=>a+b,0)/values.length),best:Math.max(...values)})).sort((a,b)=>a.day.localeCompare(b.day));
+    return {daily,players:[...perPlayer.values()].sort((a,b)=>b.total-a.total).slice(0,5),since:from,until:today,days};
+  }
+  const dateLabel = day => {const [y,m,d]=day.split('-');return language==='fi'?`${Number(d)}.${Number(m)}.`:`${Number(m)}/${Number(d)}`;};
+  function drawChart(id,legId,series,days) {
+    const target=$(id),legend=$(legId),observations=series.some(s=>s.items.length);
+    if (!observations) {target.innerHTML=`<div class="chart-empty">${esc(t('chartNoData'))}</div>`;legend.innerHTML='';return;}
+    const dates=Array.from({length:days},(_,i)=>pastDate(today,i-days+1));
+    const dateIndices=new Map(dates.map((d,i)=>[d,i]));
+    const x=i=>Math.round((43 + i/(days-1)*668)*10)/10;
+    const y=score=>Math.round((221 - (Number(score)/700)*184)*10)/10;
+    const grid=[0,175,350,525,700].map(tick=>`<line x1="43" y1="${y(tick)}" x2="711" y2="${y(tick)}" stroke="#456772" stroke-opacity=".40"/><text x="34" y="${y(tick)+4}" text-anchor="end" fill="#8eacb0" font-size="11">${tick}</text>`).join('');
+    const indexes=[0,Math.round((days-1)/2),days-1];
+    const labels=indexes.map(i=>`<text x="${x(i)}" y="249" text-anchor="middle" fill="#8eacb0" font-size="11">${dateLabel(dates[i])}</text>`).join('');
+    const lines=series.map((s,j)=>{
+      const pts=s.items.filter(r=>dateIndices.has(r.day)&&Number.isFinite(Number(r.score))&&r.score>=0&&r.score<=700).map(r=>({day:r.day,score:r.score,i:dateIndices.get(r.day)}));
+      const color=chartColors[j%chartColors.length];
+      const path=pts.length?`<polyline points="${pts.map(p=>`${x(p.i)},${y(p.score)}`).join(' ')}" fill="none" stroke="${color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>`:'';
+      const circles=pts.map(p=>`<circle cx="${x(p.i)}" cy="${y(p.score)}" r="3.7" fill="${color}" stroke="#0e2b36" stroke-width="1.4"><title>${esc(s.name)} · ${esc(p.day)} · ${Number(p.score)} / 700</title></circle>`).join('');
+      return path+circles;
+    }).join('');
+    target.innerHTML=`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 735 260" role="img" aria-label="${esc(series.map(s=>s.name).join(', '))}">${grid}${labels}${lines}</svg>`;
+    legend.innerHTML=series.map((s,j)=>`<span style="--series:${chartColors[j%chartColors.length]}">${esc(s.name)}</span>`).join('');
+  }
+  function renderCharts(data) {
+    if (!data) return;
+    const daily=data.daily||[];
+    drawChart('chart-daily','legend-daily',[
+      {name:t('chartAverage'),items:daily.map(d=>({day:d.day,score:d.average}))},
+      {name:t('chartBest'),items:daily.map(d=>({day:d.day,score:d.best}))}
+    ],data.days);
+    drawChart('chart-players','legend-players',(data.players||[]).map(p=>({name:p.name,items:p.results})),data.days);
+  }
+  async function loadStats() {
+    const id=++state.statsRequestId;
+    $('chart-daily').classList.add('loading');$('chart-players').classList.add('loading');
+    try {
+      const data=state.demo?demoStats(state.statsDays):await getJSON(`/stats?days=${state.statsDays}`);
+      if (id===state.statsRequestId){state.statsData=data;renderCharts(data);}
+    } catch {
+      if(id===state.statsRequestId) {$('chart-daily').textContent=t('fetchFail');$('chart-players').textContent=t('fetchFail');}
+    } finally {if(id===state.statsRequestId){$('chart-daily').classList.remove('loading');$('chart-players').classList.remove('loading');}}
+  }
+  function pairStatus(message){$('pair-status').textContent=message;}
+  async function createPairCode() {
+    if(state.demo){pairStatus(t('pairUnavailable'));return;}
+    const button=$('pair-create');button.disabled=true;
+    try {
+      const res=await fetch(`${API_ROOT}/link/create`,{method:'POST',headers:{'X-Kriljoona-Player':playerToken()},cache:'no-store'});
+      const data=await res.json();
+      if(!res.ok){pairStatus(res.status===409?t('pairFirstScore'):t('pairInvalid'));return;}
+      $('pair-code').classList.remove('hidden');$('pair-code').textContent=data.code;
+      pairStatus(t('pairCreated'));
+    } catch {pairStatus(t('fetchFail'));} finally {button.disabled=false;}
+  }
+  async function redeemPairCode(){
+    const code=$('pair-input').value.replace(/[\s-]/g,'').toUpperCase();
+    if(!/^[A-F0-9]{16}$/.test(code)){pairStatus(t('pairInvalid'));return;}
+    if(state.demo){pairStatus(t('pairUnavailable'));return;}
+    const button=$('pair-redeem');button.disabled=true;
+    try {
+      const res=await fetch(`${API_ROOT}/link/redeem`,{method:'POST',headers:{'X-Kriljoona-Player':playerToken(),'Content-Type':'application/json'},body:JSON.stringify({code}),cache:'no-store'});
+      const data=await res.json();
+      if(!res.ok){pairStatus(t('pairInvalid'));return;}
+      pairStatus(t(data.alreadyLinked?'pairAlready':'pairLinked'));
+      $('pair-input').value='';await load();await loadStats();
+    }catch{pairStatus(t('fetchFail'));}finally{button.disabled=false;}
+  }
   function updateHero(board){setText('hero-depth',board.count?number(board.topScore*10):'—');setText('ocean-status',board.count===0?t('awaiting'):board.count===1?t('oneSurfaced'):t('manySurfaced',{count:number(board.count)}));}
   function render(data){state.data=data;renderStats(data);renderPodium(data.entries);renderRows(data.entries);renderMyScore(data);
     setText('board-count',t('totalCount',{count:number(data.count)}));
@@ -204,7 +285,7 @@
     try {if(state.demo){const db=getDemoDB(),existing=db.entries.find(e=>e.day===today&&e.id==='me');if(existing){existing.name=name;existing.score=score;}else db.entries.push({id:'me',name,score,day:today,created_at:new Date().toISOString()});putSaved(demoKey,JSON.stringify(db));}
       else await getJSON('/submit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,score})});
       putSaved('kriljoona-name',name);formFeedback(t('submitSuccess'),'success');toast(t('toastSuccess'));
-      state.lastScore=score;activateTab('daily');state.date=today;$('selected-date').value=today;$('next-day').disabled=true;updateURL();await load();
+      state.lastScore=score;activateTab('daily');state.date=today;$('selected-date').value=today;$('next-day').disabled=true;updateURL();await load();await loadStats();
     }catch{formFeedback(t('fetchFail'),'error');}
     finally{button.disabled=false;button.textContent=t(state.data?.me&&state.tab==='daily'&&state.date===today?'updateButton':'submitButton');}
   }
@@ -225,8 +306,11 @@
     $('next-day').addEventListener('click',()=>selectDate(pastDate(state.date,1)));
     $('player-score').addEventListener('input',updatePreview);$('submit-form').addEventListener('submit',submit);
     $('copy-board').addEventListener('click',()=>copyText(location.href));
+    $('stats-range').addEventListener('change',ev=>{state.statsDays=Number(ev.target.value);loadStats();});
+    $('pair-create').addEventListener('click',createPairCode);
+    $('pair-redeem').addEventListener('click',redeemPairCode);
     $('share-result').addEventListener('click',()=>copyText(t('shareText',{depth:number((state.lastScore??0)*10),score:number(state.lastScore??0),url:location.origin==='null'?'benworton.com/kriljoona':location.origin+location.pathname})));
-    setLanguage(language);load();if(state.tab==='alltime'||state.date!==today)loadTodayHero();
+    setLanguage(language);load();loadStats();if(state.tab==='alltime'||state.date!==today)loadTodayHero();
   }
   boot();
 })();
